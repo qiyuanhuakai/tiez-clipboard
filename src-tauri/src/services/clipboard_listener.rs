@@ -14,6 +14,22 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WNDCLASSW,
 };
 
+#[cfg(not(target_os = "windows"))]
+fn hash_image_signature(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.len().hash(&mut hasher);
+    if let Some(first) = bytes.first() {
+        first.hash(&mut hasher);
+    }
+    if !bytes.is_empty() {
+        bytes[bytes.len() / 2].hash(&mut hasher);
+        bytes[bytes.len() - 1].hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 pub fn listen_clipboard(callback: Arc<dyn Fn() + Send + Sync + 'static>) {
     #[cfg(target_os = "windows")]
     std::thread::spawn(move || {
@@ -96,9 +112,18 @@ pub fn listen_clipboard(callback: Arc<dyn Fn() + Send + Sync + 'static>) {
                 text.hash(&mut hasher);
             }
 
+            if let Some(html) = crate::infrastructure::linux_api::clipboard::get_clipboard_html() {
+                html.hash(&mut hasher);
+            }
+
             if let Some(files) = crate::infrastructure::linux_api::clipboard::get_clipboard_files()
             {
                 files.hash(&mut hasher);
+            }
+
+            if let Some(image) = crate::infrastructure::linux_api::clipboard::get_clipboard_image()
+            {
+                hash_image_signature(&image.bytes).hash(&mut hasher);
             }
 
             let current_hash = hasher.finish();

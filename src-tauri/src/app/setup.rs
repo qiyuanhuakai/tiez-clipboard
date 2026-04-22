@@ -40,6 +40,76 @@ static WINDOW_SIZE_SAVE_PENDING: AtomicBool = AtomicBool::new(false);
 static LAST_WINDOW_SIZE_EVENT_MS: AtomicU64 = AtomicU64::new(0);
 static LAST_WINDOW_SIZE: OnceLock<Mutex<(u32, u32)>> = OnceLock::new();
 
+fn current_user_window_pinned(app_handle: &AppHandle) -> bool {
+    if let Some(db_state) = app_handle.try_state::<DbState>() {
+        if let Ok(val) = db_state.settings_repo.get("app.window_pinned") {
+            return val.as_deref() == Some("true");
+        }
+    }
+    WINDOW_PINNED.load(Ordering::Relaxed)
+}
+
+fn apply_window_pin_mode(window: &tauri::WebviewWindow, pinned: bool) {
+    let _ = window.set_always_on_top(pinned);
+    let _ = window.set_focusable(!pinned);
+
+    #[cfg(windows)]
+    if let Ok(hwnd) = window.hwnd() {
+        unsafe {
+            let ex_style = windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(
+                HWND(hwnd.0),
+                GWL_EXSTYLE,
+            );
+            let next = if pinned {
+                ex_style | WS_EX_NOACTIVATE.0 as isize
+            } else {
+                ex_style & !(WS_EX_NOACTIVATE.0 as isize)
+            };
+            let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowLongPtrW(
+                HWND(hwnd.0),
+                GWL_EXSTYLE,
+                next,
+            );
+        }
+    }
+}
+
+fn apply_edge_dock_runtime_pin(app_handle: &AppHandle, window: &tauri::WebviewWindow) {
+    if EDGE_DOCK_FORCED_PINNED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    let _ = window.set_always_on_top(true);
+    let _ = window.set_focusable(false);
+
+    #[cfg(windows)]
+    if let Ok(hwnd) = window.hwnd() {
+        unsafe {
+            let ex_style = windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(
+                HWND(hwnd.0),
+                GWL_EXSTYLE,
+            );
+            let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowLongPtrW(
+                HWND(hwnd.0),
+                GWL_EXSTYLE,
+                ex_style | WS_EX_NOACTIVATE.0 as isize,
+            );
+        }
+    }
+
+    let _ = app_handle.emit("window-pinned-changed", true);
+}
+
+fn restore_edge_dock_runtime_pin(app_handle: &AppHandle, window: &tauri::WebviewWindow) {
+    if !EDGE_DOCK_FORCED_PINNED.swap(false, Ordering::Relaxed) {
+        return;
+    }
+
+    let user_pinned = current_user_window_pinned(app_handle);
+    apply_window_pin_mode(window, user_pinned);
+    let _ = app_handle.emit("window-pinned-changed", user_pinned);
+}
+
 pub fn init(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     let app_handle = app.handle().clone();
 
@@ -387,6 +457,7 @@ fn setup_state(
 fn setup_main_window(app: &App, s: &StartupSettings) {
     let effective_pinned = s.window_pinned;
     WINDOW_PINNED.store(effective_pinned, Ordering::Relaxed);
+    EDGE_DOCK_FORCED_PINNED.store(false, Ordering::Relaxed);
 
     if let Some(window) = app.get_webview_window("main") {
         if let (Some(w), Some(h)) = (s.window_width, s.window_height) {
@@ -397,31 +468,7 @@ fn setup_main_window(app: &App, s: &StartupSettings) {
                 }));
             }
         }
-        let _ = window.set_always_on_top(effective_pinned);
-        let _ = window.set_focusable(!effective_pinned);
-
-        #[cfg(windows)]
-        if let Ok(hwnd) = window.hwnd() {
-            unsafe {
-                let ex_style = windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(
-                    HWND(hwnd.0),
-                    GWL_EXSTYLE,
-                );
-                if effective_pinned {
-                    let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowLongPtrW(
-                        HWND(hwnd.0),
-                        GWL_EXSTYLE,
-                        ex_style | WS_EX_NOACTIVATE.0 as isize,
-                    );
-                } else {
-                    let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowLongPtrW(
-                        HWND(hwnd.0),
-                        GWL_EXSTYLE,
-                        ex_style & !(WS_EX_NOACTIVATE.0 as isize),
-                    );
-                }
-            }
-        }
+        apply_window_pin_mode(&window, effective_pinned);
     }
 
     // Handle silent start
@@ -510,6 +557,7 @@ fn start_edge_docking_monitor(app_handle: AppHandle) {
                         let _ = window.show();
                         IS_HIDDEN.store(false, Ordering::Relaxed);
                         CURRENT_DOCK.store(0, Ordering::Relaxed);
+                        restore_edge_dock_runtime_pin(&app_handle, &window);
                     }
                 }
                 continue;
@@ -692,28 +740,10 @@ fn start_edge_docking_monitor(app_handle: AppHandle) {
                     }
 
                     if !IS_HIDDEN.load(Ordering::Relaxed) {
-                        // Auto-enable pin only when docking occurs (runtime only, no DB write)
+                        // Edge docking needs a temporary topmost/non-activating mode, but it
+                        // should not overwrite the user's persisted pin preference.
                         if !WINDOW_PINNED.load(Ordering::Relaxed) {
-                            WINDOW_PINNED.store(true, Ordering::Relaxed);
-                            let _ = window.set_always_on_top(true);
-                            let _ = window.set_focusable(false);
-                            #[cfg(windows)]
-                            if let Ok(hwnd) = window.hwnd() {
-                                unsafe {
-                                    let ex_style =
-                                        windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(
-                                            HWND(hwnd.0),
-                                            GWL_EXSTYLE,
-                                        );
-                                    let _ =
-                                        windows::Win32::UI::WindowsAndMessaging::SetWindowLongPtrW(
-                                            HWND(hwnd.0),
-                                            GWL_EXSTYLE,
-                                            ex_style | WS_EX_NOACTIVATE.0 as isize,
-                                        );
-                                }
-                            }
-                            let _ = app_handle.emit("window-pinned-changed", true);
+                            apply_edge_dock_runtime_pin(&app_handle, &window);
                         }
 
                         let window_height = rect.bottom - rect.top;
@@ -747,41 +777,7 @@ fn start_edge_docking_monitor(app_handle: AppHandle) {
                 } else if IS_HIDDEN.load(Ordering::Relaxed) {
                     IS_HIDDEN.store(false, Ordering::Relaxed);
                     CURRENT_DOCK.store(0, Ordering::Relaxed);
-
-                    // Restore pinned state based on user setting when undocked
-                    let mut user_pinned = WINDOW_PINNED.load(Ordering::Relaxed);
-                    if let Some(db_state) = app_handle.try_state::<DbState>() {
-                        if let Ok(val) = db_state.settings_repo.get("app.window_pinned") {
-                            user_pinned = val.as_deref() == Some("true");
-                        }
-                    }
-
-                    let prev = WINDOW_PINNED.swap(user_pinned, Ordering::Relaxed);
-                    if prev != user_pinned {
-                        let _ = window.set_always_on_top(user_pinned);
-                        let _ = window.set_focusable(!user_pinned);
-                        #[cfg(windows)]
-                        if let Ok(hwnd) = window.hwnd() {
-                            unsafe {
-                                let ex_style =
-                                    windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(
-                                        HWND(hwnd.0),
-                                        GWL_EXSTYLE,
-                                    );
-                                let next = if user_pinned {
-                                    ex_style | WS_EX_NOACTIVATE.0 as isize
-                                } else {
-                                    ex_style & !(WS_EX_NOACTIVATE.0 as isize)
-                                };
-                                let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowLongPtrW(
-                                    HWND(hwnd.0),
-                                    GWL_EXSTYLE,
-                                    next,
-                                );
-                            }
-                        }
-                        let _ = app_handle.emit("window-pinned-changed", user_pinned);
-                    }
+                    restore_edge_dock_runtime_pin(&app_handle, &window);
                 }
             }
         }
@@ -821,6 +817,7 @@ fn start_edge_docking_monitor(app_handle: AppHandle) {
                         let _ = window.show();
                         IS_HIDDEN.store(false, Ordering::Relaxed);
                         CURRENT_DOCK.store(0, Ordering::Relaxed);
+                        restore_edge_dock_runtime_pin(&app_handle, &window);
                     }
                 }
                 continue;
@@ -998,10 +995,7 @@ fn start_edge_docking_monitor(app_handle: AppHandle) {
 
                     if !IS_HIDDEN.load(Ordering::Relaxed) {
                         if !WINDOW_PINNED.load(Ordering::Relaxed) {
-                            WINDOW_PINNED.store(true, Ordering::Relaxed);
-                            let _ = window.set_always_on_top(true);
-                            let _ = window.set_focusable(false);
-                            let _ = app_handle.emit("window-pinned-changed", true);
+                            apply_edge_dock_runtime_pin(&app_handle, &window);
                         }
 
                         let window_height = rect_bottom - rect_top;
@@ -1040,20 +1034,7 @@ fn start_edge_docking_monitor(app_handle: AppHandle) {
                 } else if IS_HIDDEN.load(Ordering::Relaxed) {
                     IS_HIDDEN.store(false, Ordering::Relaxed);
                     CURRENT_DOCK.store(0, Ordering::Relaxed);
-
-                    let mut user_pinned = WINDOW_PINNED.load(Ordering::Relaxed);
-                    if let Some(db_state) = app_handle.try_state::<DbState>() {
-                        if let Ok(val) = db_state.settings_repo.get("app.window_pinned") {
-                            user_pinned = val.as_deref() == Some("true");
-                        }
-                    }
-
-                    let prev = WINDOW_PINNED.swap(user_pinned, Ordering::Relaxed);
-                    if prev != user_pinned {
-                        let _ = window.set_always_on_top(user_pinned);
-                        let _ = window.set_focusable(!user_pinned);
-                        let _ = app_handle.emit("window-pinned-changed", user_pinned);
-                    }
+                    restore_edge_dock_runtime_pin(&app_handle, &window);
                 }
             }
         }

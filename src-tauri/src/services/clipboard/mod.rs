@@ -25,8 +25,10 @@ use crate::infrastructure::linux_api::clipboard as clipboard_api;
 #[cfg(target_os = "windows")]
 use crate::infrastructure::windows_api::win_clipboard as clipboard_api;
 
+use utils::attach_rich_image_fallback;
+
 #[cfg(target_os = "windows")]
-use utils::{attach_rich_image_fallback, parse_cf_html};
+use utils::parse_cf_html;
 
 enum ClipboardProcessPayload {
     Pipeline {
@@ -276,6 +278,12 @@ fn clipboard_image_fallback_data_url() -> Option<String> {
     None
 }
 
+#[cfg(not(target_os = "windows"))]
+fn clipboard_image_fallback_data_url() -> Option<String> {
+    let image = clipboard_api::get_clipboard_image()?;
+    build_png_data_url_from_rgba(image.width as u32, image.height as u32, image.bytes)
+}
+
 pub fn start_clipboard_monitor(app_handle: AppHandle) {
     use std::sync::{Arc, Mutex};
 
@@ -517,7 +525,13 @@ pub fn start_clipboard_monitor(app_handle: AppHandle) {
             };
 
             #[cfg(not(target_os = "windows"))]
-            let has_rich_html = false;
+            let has_rich_html = if _rich_text_enabled && _has_text {
+                clipboard_api::get_clipboard_html()
+                    .map(|html| !html.trim().is_empty())
+                    .unwrap_or(false)
+            } else {
+                false
+            };
 
             // Rich text wins over image when rich HTML exists; image remains fallback for pure image content.
             if !has_rich_html {
@@ -716,7 +730,28 @@ pub fn start_clipboard_monitor(app_handle: AppHandle) {
 
                         #[cfg(not(target_os = "windows"))]
                         {
-                            // Linux: Rich text HTML not supported via native Windows API
+                            if let Some(html) = clipboard_api::get_clipboard_html() {
+                                if !html.trim().is_empty() {
+                                    let mut html_to_store = html;
+
+                                    if let Some(data_url) = clipboard_image_fallback_data_url() {
+                                        html_to_store =
+                                            attach_rich_image_fallback(&html_to_store, &data_url);
+                                    }
+
+                                    monitor_state.last_text = text.clone();
+                                    process_new_entry_async(
+                                        app.clone(),
+                                        ClipboardData::RichText {
+                                            text: text.clone(),
+                                            html: html_to_store,
+                                        },
+                                        None,
+                                        Some(source_snapshot.clone()),
+                                    );
+                                    handled = true;
+                                }
+                            }
                         }
                     }
 

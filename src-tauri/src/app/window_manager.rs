@@ -119,7 +119,9 @@ pub fn toggle_window(app: &AppHandle) {
         if let Ok(size) = window.outer_size() {
             let settings = app.state::<SettingsState>();
             if settings.follow_mouse.load(Ordering::Relaxed) {
+                #[allow(unused_variables)]
                 let w = size.width as i32;
+                #[allow(unused_variables)]
                 let h = size.height as i32;
 
                 #[cfg(windows)]
@@ -338,7 +340,9 @@ pub fn toggle_window(app: &AppHandle) {
                     }
                 }
             } else {
+                #[allow(unused_variables)]
                 let w = size.width as i32;
+                #[allow(unused_variables)]
                 let h = size.height as i32;
 
                 #[cfg(windows)]

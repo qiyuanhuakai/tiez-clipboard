@@ -1,4 +1,5 @@
 use crate::error::{AppError, AppResult};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -29,6 +30,19 @@ pub fn get_clipboard_image() -> Option<ImageData> {
 }
 
 pub fn get_clipboard_files() -> Option<Vec<String>> {
+    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+        if let Ok(files) = clipboard.get().file_list() {
+            let files: Vec<String> = files
+                .into_iter()
+                .filter_map(|path| path.to_str().map(|value| value.to_string()))
+                .filter(|path| !path.is_empty())
+                .collect();
+            if !files.is_empty() {
+                return Some(files);
+            }
+        }
+    }
+
     use std::time::Duration;
 
     let clipboard = x11_clipboard::Clipboard::new().ok()?;
@@ -69,11 +83,27 @@ pub fn get_clipboard_raw_format(_name: &str) -> Option<Vec<u8>> {
     None
 }
 
+pub fn get_clipboard_html() -> Option<String> {
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    clipboard
+        .get()
+        .html()
+        .ok()
+        .filter(|html| !html.trim().is_empty())
+}
+
 pub fn set_clipboard_files(paths: Vec<String>) -> Result<(), String> {
     let normalized_paths: Vec<String> = paths.into_iter().filter(|path| !path.is_empty()).collect();
 
     if normalized_paths.is_empty() {
         return Err("没有可写入剪贴板的文件路径".to_string());
+    }
+
+    let arboard_paths: Vec<PathBuf> = normalized_paths.iter().map(PathBuf::from).collect();
+    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+        if clipboard.set().file_list(&arboard_paths).is_ok() {
+            return Ok(());
+        }
     }
 
     // `x11-clipboard` can only advertise one target per selection owner, so on

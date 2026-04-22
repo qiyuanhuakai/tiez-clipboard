@@ -276,7 +276,15 @@ pub(crate) fn write_content_to_system_clipboard(
     let (content_hash, current_time) = calculate_content_hash(content);
 
     let clipboard_hashes = match content_type {
-        "image" | "video" | "file" => copy_file_like_content(content, content_type, current_time, content_hash)?,
+        "image" | "video" | "file" => {
+            copy_file_like_content(
+                content,
+                content_type,
+                current_time,
+                content_hash,
+                paste_with_format,
+            )?
+        }
         ct if ct == "rich_text" || (paste_with_format && html_content.is_some()) => {
             copy_rich_text_content(content, html_content, paste_with_format, current_time)?
         }
@@ -298,13 +306,14 @@ fn copy_file_like_content(
     content_type: &str,
     current_time: u64,
     content_hash: u64,
+    paste_with_format: bool,
 ) -> AppResult<(u64, u64)> {
     if !content.starts_with("data:") && (content.starts_with('/') || content.contains(":\\")) {
-        return copy_local_path_content(content, content_type, current_time);
+        return copy_local_path_content(content, content_type, current_time, paste_with_format);
     }
 
     if content_type == "image" {
-        return copy_inline_image_content(content, current_time);
+        return copy_inline_image_content(content, current_time, paste_with_format);
     }
 
     let mut clipboard = arboard::Clipboard::new().map_err(AppError::from)?;
@@ -316,6 +325,7 @@ fn copy_local_path_content(
     content: &str,
     content_type: &str,
     current_time: u64,
+    _paste_with_format: bool,
 ) -> AppResult<(u64, u64)> {
     let paths = split_local_paths(content);
 
@@ -325,6 +335,7 @@ fn copy_local_path_content(
         };
 
         let bytes = std::fs::read(path).map_err(AppError::from)?;
+
         return copy_image_bytes_to_clipboard(bytes, current_time);
     }
 
@@ -345,7 +356,11 @@ fn copy_local_path_content(
     Ok((path_hash.max(1), 0))
 }
 
-fn copy_inline_image_content(content: &str, current_time: u64) -> AppResult<(u64, u64)> {
+fn copy_inline_image_content(
+    content: &str,
+    current_time: u64,
+    _paste_with_format: bool,
+) -> AppResult<(u64, u64)> {
     let b64_data = if content.starts_with("data:image") {
         content.split(',').nth(1).unwrap_or(content)
     } else {
@@ -377,22 +392,21 @@ fn copy_rich_text_content(
         return Ok((content_hash.max(1), 0));
     }
 
-    let (_clean_html, fallback_image_data_url) = split_rich_html_and_image_fallback(html);
+    let (clean_html, fallback_image_data_url) = split_rich_html_and_image_fallback(html);
     #[cfg(target_os = "windows")]
-    let html_for_paste = if _clean_html.trim().is_empty() {
+    let html_for_paste = if clean_html.trim().is_empty() {
         html
     } else {
-        _clean_html.as_str()
+        clean_html.as_str()
     };
     #[cfg(target_os = "windows")]
     let cf_html = generate_cf_html(html_for_paste);
 
     if let Some(payload) = fallback_image_data_url {
+        #[allow(unused_variables)]
         if let Some(bytes) = resolve_rich_image_fallback_bytes(&payload) {
             #[cfg(target_os = "windows")]
             let image_hashes = copy_image_bytes_to_clipboard(bytes, _current_time)?;
-            #[cfg(not(target_os = "windows"))]
-            copy_image_bytes_to_clipboard(bytes, _current_time)?;
             let (content_hash, _) = calculate_content_hash(content);
             #[cfg(target_os = "windows")]
             {
@@ -404,9 +418,18 @@ fn copy_rich_text_content(
             }
             #[cfg(not(target_os = "windows"))]
             {
-                // Linux fallback: copy as plain text
-                let mut clipboard = arboard::Clipboard::new().map_err(AppError::from)?;
-                clipboard.set_text(content.to_string()).map_err(AppError::from)?;
+                let html_for_paste = if clean_html.trim().is_empty() {
+                    format!(
+                        "<!DOCTYPE html><html><body><img src=\"{}\" alt=\"\" /></body></html>",
+                        payload
+                    )
+                } else {
+                    clean_html.clone()
+                };
+                crate::infrastructure::linux_api::clipboard::set_clipboard_text_and_html(
+                    content.to_string(),
+                    Some(html_for_paste),
+                )?;
                 return Ok((content_hash.max(1), 0));
             }
         }
@@ -419,9 +442,15 @@ fn copy_rich_text_content(
     }
     #[cfg(not(target_os = "windows"))]
     {
-        // Linux fallback: copy as plain text
-        let mut clipboard = arboard::Clipboard::new().map_err(AppError::from)?;
-        clipboard.set_text(content.to_string()).map_err(AppError::from)?;
+        let html_for_paste = if clean_html.trim().is_empty() {
+            html.to_string()
+        } else {
+            clean_html
+        };
+        crate::infrastructure::linux_api::clipboard::set_clipboard_text_and_html(
+            content.to_string(),
+            Some(html_for_paste),
+        )?;
     }
     let (content_hash, _) = calculate_content_hash(content);
     Ok((content_hash.max(1), 0))
