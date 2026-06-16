@@ -17,8 +17,9 @@
   - 支持 deb、AppImage、rpm 打包格式
 - 更易扩展的主题支持
   - 尽可能减少主题设置在代码中的硬编码，以便于后续的主题定制
-  - 增加`macos`，由AI辅助设计的MacOS风格新主题
-  - 增加`scifi`, 由AI辅助设计的科幻风格新主题；这两套主题使用同一个base框架
+  - 增加`macos`，由AI辅助设计的MacOS风格新主题；
+  - 增加`scifi`, 由AI辅助设计的科幻风格新主题；
+  - 增加`liquidglass`,由AI辅助设计的拟液态玻璃（无模糊效果）新主题
   - 扩展主题能定制的控件的范围：例如，现在下拉栏的风格会随主题改变了
 - 简单且有用的新功能
   - 新增右键图片时粘贴`base64`编码的支持
@@ -53,13 +54,13 @@ sudo dnf install gtk3-devel webkit2gtk3-devel libappindicator-gtk3-devel xdotool
 
 ```bash
 # 安装前端依赖
-npm install
+pnpm install
 
 # 开发模式
-npm run tauri:dev
+pnpm run tauri:dev
 
 # 构建 Linux 版本
-npm run tauri:build
+pnpm run tauri:build
 ```
 
 构建完成后，安装包位于 `src-tauri/target/release/bundle/` 目录下。
