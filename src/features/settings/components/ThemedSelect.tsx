@@ -1,7 +1,10 @@
+import { useMemo, useRef } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import Select from "react-select";
-import type { SingleValue } from "react-select";
+import type { FilterOptionOption, SingleValue } from "react-select";
+import { FuzzyIndex } from "../../../shared/lib/fuzzy";
 
-interface ThemedSelectOption {
+export interface ThemedSelectOption {
   value: string;
   label: string;
   disabled?: boolean;
@@ -13,6 +16,9 @@ interface ThemedSelectProps {
   onChange: (value: string) => void | Promise<void>;
   width?: string;
   placeholder?: string;
+  searchable?: boolean;
+  noOptionsMessage?: string;
+  isDisabled?: boolean;
 }
 
 const ThemedSelect = ({
@@ -20,21 +26,74 @@ const ThemedSelect = ({
   value,
   onChange,
   width = "160px",
-  placeholder
+  placeholder,
+  searchable = false,
+  noOptionsMessage,
+  isDisabled = false
 }: ThemedSelectProps) => {
   const selected = options.find((option) => option.value === value) ?? null;
 
+  const index = useMemo(
+    () =>
+      new FuzzyIndex(options, {
+        keys: [
+          { name: "label", weight: 2 },
+          { name: "value", weight: 1 }
+        ],
+        threshold: 0.4,
+        minMatchCharLength: 1
+      }),
+    [options]
+  );
+
+  const allowCacheRef = useRef<{ input: string; values: Set<string> | null }>({
+    input: "",
+    values: null
+  });
+
+  const filterOption = useMemo(
+    () =>
+      searchable
+        ? (option: FilterOptionOption<ThemedSelectOption>, rawInput: string) => {
+            const input = rawInput ?? "";
+            if (!input) return true;
+            const cached = allowCacheRef.current;
+            if (cached.input !== input) {
+              const matches = index.search(input, options.length);
+              cached.input = input;
+              cached.values = new Set(
+                matches.map((m) => (m.item as ThemedSelectOption).value)
+              );
+            }
+            return cached.values!.has(option.value);
+          }
+        : undefined,
+    [searchable, index, options]
+  );
+
   return (
-    <div style={{ width }}>
+    <div
+      style={{ width }}
+      onMouseDown={() => {
+        invoke("activate_window_focus").catch(console.error);
+      }}
+      onFocus={() => {
+        invoke("activate_window_focus").catch(console.error);
+      }}
+    >
       <Select
         classNamePrefix="tiez-select"
         options={options}
         value={selected}
         placeholder={placeholder}
-        isSearchable={false}
+        isSearchable={searchable}
+        isClearable={false}
+        isDisabled={isDisabled}
         isOptionDisabled={(option) => !!option.disabled}
+        noOptionsMessage={() => noOptionsMessage ?? "无匹配项"}
         menuPortalTarget={document.body}
         menuPosition="fixed"
+        filterOption={filterOption}
         onChange={(option: SingleValue<ThemedSelectOption>) => {
           if (!option) return;
           void onChange(option.value);

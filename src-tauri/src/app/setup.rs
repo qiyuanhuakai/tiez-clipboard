@@ -4,7 +4,7 @@ use crate::app::hooks::{keyboard_proc, mouse_proc};
 use crate::app::system::tray_subclass_proc;
 use crate::app::window_manager::{release_win_keys, restore_last_focus, toggle_window};
 use crate::app_state::{
-    AppDataDir, EncryptionQueueState, PasteQueue, SessionHistory, SettingsState,
+    AppDataDir, EncryptionQueueState, PasteQueue, SearchHistory, SessionHistory, SettingsState,
 };
 use crate::database::{self, DbState};
 use crate::global_state::*;
@@ -100,6 +100,10 @@ pub fn init(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
 
     // 6. Window Initialization (Pinned/Focus)
     setup_main_window(app, &settings);
+
+    // 6.0a Hide auxiliary windows on startup (Windows-only regression: fullscreen
+    // region-select flashes above all other windows even with visible:false).
+    hide_auxiliary_windows(app);
 
     // 6.1 External Drag-Drop (Web Images)
     #[cfg(windows)]
@@ -222,6 +226,11 @@ pub struct StartupSettings {
     pub sequential_hotkey: String,
     pub rich_paste_hotkey: String,
     pub search_hotkey: String,
+    pub screenshot_enabled: bool,
+    pub screenshot_hotkey: String,
+    pub quick_paste_enabled: bool,
+    pub quick_paste_hotkey: String,
+    pub ocr_enabled: bool,
     pub sound_enabled: bool,
     pub hide_tray_icon: bool,
     pub edge_docking: bool,
@@ -301,6 +310,29 @@ fn load_settings(repo: &impl SettingsRepository) -> StartupSettings {
             .get("app.search_hotkey")
             .unwrap_or(Some("Alt+F".to_string()))
             .unwrap_or("Alt+F".to_string()),
+        screenshot_enabled: repo
+            .get("app.screenshot_enabled")
+            .unwrap_or(Some("true".to_string()))
+            .map(|v| v == "true")
+            .unwrap_or(true),
+        screenshot_hotkey: repo
+            .get("app.screenshot_hotkey")
+            .unwrap_or(Some("Ctrl+Shift+A".to_string()))
+            .unwrap_or("Ctrl+Shift+A".to_string()),
+        quick_paste_enabled: repo
+            .get("app.quick_paste_enabled")
+            .unwrap_or(Some("true".to_string()))
+            .map(|v| v == "true")
+            .unwrap_or(true),
+        quick_paste_hotkey: repo
+            .get("app.quick_paste_hotkey")
+            .unwrap_or(Some("Ctrl+Shift+V".to_string()))
+            .unwrap_or("Ctrl+Shift+V".to_string()),
+        ocr_enabled: repo
+            .get("app.ocr_enabled")
+            .unwrap_or(Some("true".to_string()))
+            .map(|v| v == "true")
+            .unwrap_or(true),
         sound_enabled: repo
             .get("app.sound_enabled")
             .unwrap_or(Some("false".to_string()))
@@ -401,6 +433,11 @@ fn setup_state(
         sequential_paste_hotkey: std::sync::Mutex::new(s.sequential_hotkey.clone()),
         rich_paste_hotkey: std::sync::Mutex::new(s.rich_paste_hotkey.clone()),
         search_hotkey: std::sync::Mutex::new(s.search_hotkey.clone()),
+        screenshot_enabled: AtomicBool::new(s.screenshot_enabled),
+        screenshot_hotkey: std::sync::Mutex::new(s.screenshot_hotkey.clone()),
+        quick_paste_enabled: AtomicBool::new(s.quick_paste_enabled),
+        quick_paste_hotkey: std::sync::Mutex::new(s.quick_paste_hotkey.clone()),
+        ocr_enabled: AtomicBool::new(s.ocr_enabled),
         sound_enabled: AtomicBool::new(s.sound_enabled),
         hide_tray_icon: AtomicBool::new(s.hide_tray_icon),
         edge_docking: AtomicBool::new(s.edge_docking),
@@ -417,6 +454,16 @@ fn setup_state(
     )));
     app.manage(AppDataDir(std::sync::Mutex::new(app_dir)));
     app.manage(PasteQueue::default());
+    app.manage(SearchHistory::default());
+}
+
+fn hide_auxiliary_windows(app: &App) {
+    for label in ["quick-paste", "region-select"] {
+        if let Some(window) = app.get_webview_window(label) {
+            let _ = window.hide();
+            let _ = window.set_focusable(false);
+        }
+    }
 }
 
 fn setup_main_window(app: &App, s: &StartupSettings) {
@@ -1131,7 +1178,9 @@ fn setup_tray(app: &App, hide_tray: bool) {
         .menu(&menu)
         .on_menu_event(|app, event| {
             if event.id.as_ref() == "show" {
-                crate::app::idle_destroyer::ensure_main_window(app);
+                if !crate::app::idle_destroyer::ensure_main_window(app) {
+                    return;
+                }
                 if let Some(window) = app.get_webview_window("main") {
                     crate::app::webview_memory::restore_window_memory(&window, "tray-menu-show");
                     let _ = window.show();
@@ -1149,7 +1198,9 @@ fn setup_tray(app: &App, hide_tray: bool) {
             } = event
             {
                 let app = tray.app_handle();
-                crate::app::idle_destroyer::ensure_main_window(app);
+                if !crate::app::idle_destroyer::ensure_main_window(app) {
+                    return;
+                }
                 if let Some(window) = app.get_webview_window("main") {
                     crate::app::webview_memory::restore_window_memory(&window, "tray-click-show");
                     let _ = window.show();
@@ -1304,6 +1355,33 @@ pub fn handle_global_shortcut(app: &AppHandle, shortcut: &tauri_plugin_global_sh
         if shortcut == &search_s {
             toggle_window(app);
             let _ = app.emit("focus-search-input", ());
+        }
+    }
+
+    if settings.screenshot_enabled.load(Ordering::Relaxed) {
+        if let Ok(screenshot_s) = {
+            let val = settings.screenshot_hotkey.lock().unwrap().clone();
+            val.replace("Win", "Super").parse::<Shortcut>()
+        } {
+            if shortcut == &screenshot_s {
+                let _ = crate::app::commands::screenshot_cmd::show_region_selector(app.clone());
+                return;
+            }
+        }
+    }
+
+    if settings.quick_paste_enabled.load(Ordering::Relaxed) {
+        if let Ok(quick_s) = {
+            let val = settings.quick_paste_hotkey.lock().unwrap().clone();
+            val.replace("Win", "Super").parse::<Shortcut>()
+        } {
+            if shortcut == &quick_s {
+                if crate::app::commands::quick_paste_cmd::is_quick_paste_visible(app.clone()) {
+                    let _ = crate::app::commands::quick_paste_cmd::hide_quick_paste(app.clone());
+                } else {
+                    let _ = crate::app::commands::quick_paste_cmd::show_quick_paste(app.clone());
+                }
+            }
         }
     }
 }

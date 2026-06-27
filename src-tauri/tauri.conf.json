@@ -27,6 +27,37 @@
         "visible": false,
         "dragDropEnabled": true,
         "focusable": false
+      },
+      {
+        "label": "quick-paste",
+        "title": "",
+        "url": "index.html?window=quick-paste",
+        "width": 480,
+        "height": 360,
+        "resizable": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "decorations": false,
+        "skipTaskbar": true,
+        "visible": false,
+        "focus": false,
+        "focusable": true,
+        "shadow": false
+      },
+      {
+        "label": "region-select",
+        "title": "",
+        "url": "index.html?window=region-select",
+        "width": 1920,
+        "height": 1080,
+        "fullscreen": true,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "decorations": false,
+        "skipTaskbar": true,
+        "visible": false,
+        "focus": false,
+        "shadow": false
       }
     ],
     "security": {
@@ -48,7 +79,9 @@
           "description": "Main window capabilities",
           "windows": [
             "main",
-            "compact-preview"
+            "compact-preview",
+            "quick-paste",
+            "region-select"
           ],
           "permissions": [
             "core:window:allow-start-dragging",

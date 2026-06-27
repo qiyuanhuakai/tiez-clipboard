@@ -164,6 +164,9 @@ impl PipelineStage for DiscoveryStage {
             is_external,
             pinned_order: 0,
             file_preview_exists: true,
+            content_kinds: Vec::new(),
+            ocr_text: None,
+            ocr_status: None,
         });
     }
 }
@@ -397,6 +400,13 @@ impl PipelineStage for PersistenceStage {
             let data_dir = app_data_dir.0.lock().unwrap().clone();
             let conn = db_state.conn.lock().unwrap();
 
+            let is_new_image = entry.id == 0 && entry.content_type == "image";
+            let image_content = if is_new_image {
+                Some(entry.content.clone())
+            } else {
+                None
+            };
+
             if let Ok(id) = db_state.repo.save_with_conn(&conn, entry, Some(&data_dir)) {
                 entry.id = id;
                 if let Ok(deleted_ids) = db_state
@@ -406,6 +416,22 @@ impl PipelineStage for PersistenceStage {
                     for rid in deleted_ids {
                         let _ = ctx.app_handle.emit("clipboard-removed", rid);
                     }
+                }
+            }
+            drop(conn);
+
+            if let Some(content) =
+                image_content.filter(|_| settings.ocr_enabled.load(Ordering::Relaxed))
+            {
+                if let Some(png_bytes) =
+                    crate::services::clipboard_ops::resolve_image_bytes(&content)
+                {
+                    let app = ctx.app_handle.clone();
+                    tauri::async_runtime::spawn(
+                        crate::services::clipboard_ops::trigger_ocr_for_image_item(
+                            entry.id, png_bytes, app,
+                        ),
+                    );
                 }
             }
         } else {

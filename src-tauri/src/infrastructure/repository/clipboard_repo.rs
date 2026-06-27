@@ -22,7 +22,7 @@ const HISTORY_LIST_SELECT_COLUMNS: &str = "id, content_type, \
     CASE WHEN html_content LIKE 'linux:%' OR html_content LIKE 'dpapi:%' THEN html_content ELSE substr(html_content, 1, 5004) END, \
     source_app, timestamp, \
     CASE WHEN preview LIKE 'linux:%' OR preview LIKE 'dpapi:%' THEN preview ELSE substr(preview, 1, 504) END, \
-    is_pinned, tags, use_count, is_external, pinned_order, source_app_path";
+    is_pinned, tags, use_count, is_external, pinned_order, source_app_path, ocr_text, ocr_status";
 
 fn truncate_chars_with_suffix(input: &str, limit: usize, suffix: &str) -> String {
     let Some((cut, _)) = input.char_indices().nth(limit) else {
@@ -115,6 +115,7 @@ pub trait ClipboardRepository {
         offset: i32,
         content_type: Option<&str>,
     ) -> Result<Vec<ClipboardEntry>, String>;
+    fn search_fts(&self, query: &str, limit: u32) -> Result<Vec<ClipboardEntry>, String>;
     fn search(&self, query: &str, limit: i32) -> Result<Vec<ClipboardEntry>, String>;
     fn delete(&self, id: i64, data_dir: Option<&std::path::Path>) -> Result<(), String>;
     fn clear(&self, data_dir: Option<&std::path::Path>) -> Result<(), String>;
@@ -473,8 +474,8 @@ impl SqliteClipboardRepository {
         } else {
             // Insert new entry
             conn.execute(
-                "INSERT INTO clipboard_history (content_type, content, html_content, source_app, timestamp, preview, is_pinned, content_hash, tags, is_external, pinned_order, source_app_path) 
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                "INSERT INTO clipboard_history (content_type, content, html_content, source_app, timestamp, preview, is_pinned, content_hash, tags, is_external, pinned_order, source_app_path, ocr_text, ocr_status)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL, 'pending')",
                 params![
                     entry.content_type,
                     content,
@@ -697,7 +698,7 @@ impl SqliteClipboardRepository {
         id: i64,
     ) -> Result<Option<ClipboardEntry>, String> {
         let mut stmt = conn.prepare(
-            "SELECT id, content_type, content, html_content, source_app, timestamp, preview, is_pinned, tags, use_count, is_external, pinned_order, source_app_path 
+            "SELECT id, content_type, content, html_content, source_app, timestamp, preview, is_pinned, tags, use_count, is_external, pinned_order, source_app_path, ocr_text, ocr_status 
              FROM clipboard_history 
              WHERE id = ? 
              LIMIT 1",
@@ -729,6 +730,9 @@ impl SqliteClipboardRepository {
                 pinned_order: row.get(11).unwrap_or(0),
                 source_app_path: row.get(12).unwrap_or(None),
                 file_preview_exists: true,
+                content_kinds: Vec::new(),
+                ocr_text: row.get(13).ok(),
+                ocr_status: row.get(14).ok(),
             }))
         } else {
             Ok(None)
@@ -857,6 +861,113 @@ impl SqliteClipboardRepository {
             Ok(None)
         }
     }
+
+    pub fn update_ocr_text_with_conn(
+        &self,
+        conn: &Connection,
+        id: i64,
+        ocr_text: &str,
+        ocr_status: &str,
+    ) -> Result<usize, String> {
+        let rows = conn
+            .execute(
+                "UPDATE clipboard_history
+                 SET ocr_text = ?1, ocr_status = ?2
+                 WHERE id = ?3",
+                params![ocr_text, ocr_status, id],
+            )
+            .map_err(|e| e.to_string())?;
+        self.invalidate_caches();
+        Ok(rows)
+    }
+
+    pub fn get_ocr_status_with_conn(
+        &self,
+        conn: &Connection,
+        id: i64,
+    ) -> Result<Option<(String, Option<String>)>, String> {
+        let mut stmt = conn
+            .prepare("SELECT ocr_status, ocr_text FROM clipboard_history WHERE id = ? LIMIT 1")
+            .map_err(|e| e.to_string())?;
+        let mut rows = stmt.query(params![id]).map_err(|e| e.to_string())?;
+        if let Some(row) = rows.next().map_err(|e| e.to_string())? {
+            let status: String = row.get(0).map_err(|e| e.to_string())?;
+            let text: Option<String> = row.get(1).ok();
+            Ok(Some((status, text)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn search_fts(&self, query: &str, limit: u32) -> Result<Vec<ClipboardEntry>, String> {
+        let term = query.trim();
+        if term.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+
+        let limit_i64 = limit as i64;
+        let mut stmt = conn
+            .prepare(
+                "SELECT ch.id, ch.content_type, ch.content, ch.html_content, ch.source_app,
+                        ch.timestamp, ch.preview, ch.is_pinned, ch.tags, ch.use_count,
+                        ch.is_external, ch.pinned_order, ch.source_app_path,
+                        ch.content_kinds, ch.ocr_text, ch.ocr_status,
+                        snippet(clipboard_fts, 0, '<mark>', '</mark>', '...', 16),
+                        highlight(clipboard_fts, 0, '<mark>', '</mark>')
+                 FROM clipboard_fts
+                 INNER JOIN clipboard_history ch ON ch.id = clipboard_fts.rowid
+                 WHERE clipboard_fts MATCH ?1
+                 ORDER BY rank
+                 LIMIT ?2",
+            )
+            .map_err(|e| e.to_string())?;
+
+        let rows = stmt
+            .query_map(params![term, limit_i64], |row| {
+                let tags_str: String = row.get::<_, String>(8).unwrap_or_else(|_| "[]".to_string());
+                let tags: Vec<String> = serde_json::from_str(&tags_str).unwrap_or_default();
+                let content_raw: String = row.get(2)?;
+                let preview_raw: String = row.get(6)?;
+                let html_raw: Option<String> = row.get(3).ok();
+                let content = self.maybe_decrypt_text(&content_raw);
+                let preview = self.maybe_decrypt_text(&preview_raw);
+                let html_content = html_raw.map(|v| self.maybe_decrypt_text(&v));
+
+                let _snippet: String = row.get(16)?;
+                let _highlight: String = row.get(17)?;
+
+                Ok(ClipboardEntry {
+                    id: row.get(0)?,
+                    content_type: row.get(1)?,
+                    content,
+                    html_content,
+                    source_app: row.get(4)?,
+                    timestamp: row.get(5)?,
+                    preview,
+                    is_pinned: row.get::<_, i32>(7)? == 1,
+                    tags,
+                    use_count: row.get(9).unwrap_or(0),
+                    is_external: row.get::<_, i32>(10)? == 1,
+                    pinned_order: row.get(11).unwrap_or(0),
+                    source_app_path: row.get(12).ok().flatten(),
+                    file_preview_exists: true,
+                    content_kinds: serde_json::from_str(
+                        &row.get::<_, String>(13).unwrap_or_else(|_| "[]".to_string()),
+                    )
+                    .unwrap_or_default(),
+                    ocr_text: row.get(14).ok(),
+                    ocr_status: row.get(15).ok(),
+                })
+            })
+            .map_err(|e| e.to_string())?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row.map_err(|e| e.to_string())?);
+        }
+        Ok(results)
+    }
 }
 
 impl ClipboardRepository for SqliteClipboardRepository {
@@ -919,6 +1030,12 @@ impl ClipboardRepository for SqliteClipboardRepository {
                             true
                         }
                     },
+                    content_kinds: serde_json::from_str(
+                        &row.get::<_, String>(15).unwrap_or_else(|_| "[]".to_string()),
+                    )
+                    .unwrap_or_default(),
+                    ocr_text: row.get(13).ok(),
+                    ocr_status: row.get(14).ok(),
                 },
                 content_raw,
                 preview_raw,
@@ -992,6 +1109,10 @@ impl ClipboardRepository for SqliteClipboardRepository {
         Ok(history)
     }
 
+    fn search_fts(&self, query: &str, limit: u32) -> Result<Vec<ClipboardEntry>, String> {
+        Self::search_fts(self, query, limit)
+    }
+
     fn search(&self, query: &str, limit: i32) -> Result<Vec<ClipboardEntry>, String> {
         let term = query.trim().to_lowercase();
         if term.is_empty() {
@@ -1009,18 +1130,19 @@ impl ClipboardRepository for SqliteClipboardRepository {
         {
             // Portable version: Data is NOT encrypted, use conventional SQL LIKE search (fastest)
             let mut stmt = conn.prepare(
-                "SELECT DISTINCT ch.id, ch.content_type, ch.content, ch.html_content, ch.source_app, ch.timestamp, ch.preview, ch.is_pinned, ch.tags, ch.use_count, ch.is_external, ch.pinned_order, ch.source_app_path 
-                 FROM clipboard_history ch
-                 LEFT JOIN entry_tags et ON ch.id = et.entry_id
-                 WHERE ch.content LIKE '%' || ? || '%' 
-                    OR ch.source_app LIKE '%' || ? || '%' 
-                    OR et.tag LIKE '%' || ? || '%'
+                "SELECT DISTINCT ch.id, ch.content_type, ch.content, ch.html_content, ch.source_app, ch.timestamp, ch.preview, ch.is_pinned, ch.tags, ch.use_count, ch.is_external, ch.pinned_order, ch.source_app_path, ch.ocr_text, ch.ocr_status
+	                 FROM clipboard_history ch
+	                 LEFT JOIN entry_tags et ON ch.id = et.entry_id
+	                 WHERE ch.content LIKE '%' || ? || '%'
+	                    OR ch.source_app LIKE '%' || ? || '%'
+	                    OR COALESCE(ch.ocr_text, '') LIKE '%' || ? || '%'
+	                    OR et.tag LIKE '%' || ? || '%'
                  ORDER BY ch.timestamp DESC 
                  LIMIT ?",
             ).map_err(|e| e.to_string())?;
 
             let rows = stmt
-                .query_map(params![term, term, term, limit], |row| {
+                .query_map(params![term, term, term, term, limit], |row| {
                     let tags_str: String =
                         row.get::<_, String>(8).unwrap_or_else(|_| "[]".to_string());
                     Ok(ClipboardEntry {
@@ -1038,6 +1160,9 @@ impl ClipboardRepository for SqliteClipboardRepository {
                         pinned_order: row.get(11).unwrap_or(0),
                         source_app_path: row.get(12).unwrap_or(None),
                         file_preview_exists: true, // Simplified for search
+                        content_kinds: Vec::new(),
+                        ocr_text: row.get(13).ok(),
+                        ocr_status: row.get(14).ok(),
                     })
                 })
                 .map_err(|e| e.to_string())?;
@@ -1068,18 +1193,19 @@ impl ClipboardRepository for SqliteClipboardRepository {
 
             // 1) SQL search for non-sensitive (plaintext) entries
             let sql_non_sensitive = format!(
-                "SELECT DISTINCT ch.id, ch.content_type, ch.content, ch.html_content, ch.source_app, ch.timestamp, ch.preview, ch.is_pinned, ch.tags, ch.use_count, ch.is_external, ch.pinned_order, ch.source_app_path 
-                 FROM clipboard_history ch
-                 LEFT JOIN entry_tags et ON ch.id = et.entry_id
+                "SELECT DISTINCT ch.id, ch.content_type, ch.content, ch.html_content, ch.source_app, ch.timestamp, ch.preview, ch.is_pinned, ch.tags, ch.use_count, ch.is_external, ch.pinned_order, ch.source_app_path, ch.content_kinds, ch.ocr_text, ch.ocr_status
+	                 FROM clipboard_history ch
+	                 LEFT JOIN entry_tags et ON ch.id = et.entry_id
                  WHERE NOT EXISTS (
                      SELECT 1 FROM entry_tags se 
                      WHERE se.entry_id = ch.id 
                        AND se.tag COLLATE NOCASE IN {}
                  )
                    AND (
-                     ch.content LIKE '%' || ?1 || '%' 
-                     OR ch.source_app LIKE '%' || ?1 || '%' 
-                     OR et.tag LIKE '%' || ?1 || '%'
+	                     ch.content LIKE '%' || ?1 || '%'
+	                     OR ch.source_app LIKE '%' || ?1 || '%'
+	                     OR COALESCE(ch.ocr_text, '') LIKE '%' || ?1 || '%'
+	                     OR et.tag LIKE '%' || ?1 || '%'
                    )
                  ORDER BY ch.timestamp DESC, ch.id DESC
                  LIMIT ?2",
@@ -1115,6 +1241,12 @@ impl ClipboardRepository for SqliteClipboardRepository {
                         pinned_order: row.get(11).unwrap_or(0),
                         source_app_path: row.get(12).unwrap_or(None),
                         file_preview_exists: true,
+                        content_kinds: serde_json::from_str(
+                            &row.get::<_, String>(13).unwrap_or_else(|_| "[]".to_string()),
+                        )
+                        .unwrap_or_default(),
+                        ocr_text: row.get(14).ok(),
+                        ocr_status: row.get(15).ok(),
                     })
                 })
                 .map_err(|e| e.to_string())?;
@@ -1134,8 +1266,8 @@ impl ClipboardRepository for SqliteClipboardRepository {
                 let batch_size = 500;
                 let enc_like = format!("{}%", ENCRYPT_PREFIX);
                 let sql_sensitive = format!(
-                    "SELECT ch.id, ch.content_type, ch.content, ch.html_content, ch.source_app, ch.timestamp, ch.preview, ch.is_pinned, ch.tags, ch.use_count, ch.is_external, ch.pinned_order, ch.source_app_path 
-                     FROM clipboard_history ch
+                    "SELECT ch.id, ch.content_type, ch.content, ch.html_content, ch.source_app, ch.timestamp, ch.preview, ch.is_pinned, ch.tags, ch.use_count, ch.is_external, ch.pinned_order, ch.source_app_path, ch.content_kinds, ch.ocr_text, ch.ocr_status
+	                     FROM clipboard_history ch
                      WHERE (
                          EXISTS (
                              SELECT 1 FROM entry_tags se 
@@ -1144,7 +1276,8 @@ impl ClipboardRepository for SqliteClipboardRepository {
                          )
                          OR ch.content LIKE ?1 
                          OR ch.preview LIKE ?1 
-                         OR ch.html_content LIKE ?1
+	                         OR ch.html_content LIKE ?1
+	                         OR ch.ocr_text LIKE ?1
                      )
                        AND ((ch.timestamp < ?2) OR (ch.timestamp = ?2 AND ch.id < ?3))
                      ORDER BY ch.timestamp DESC, ch.id DESC
@@ -1172,6 +1305,12 @@ impl ClipboardRepository for SqliteClipboardRepository {
                                 pinned_order: row.get(11).unwrap_or(0),
                                 source_app_path: row.get(12).unwrap_or(None),
                                 file_preview_exists: true,
+                                content_kinds: serde_json::from_str(
+                                    &row.get::<_, String>(13).unwrap_or_else(|_| "[]".to_string()),
+                                )
+                                .unwrap_or_default(),
+                                ocr_text: row.get(14).ok(),
+                                ocr_status: row.get(15).ok(),
                             })
                         })
                         .map_err(|e| e.to_string())?;
@@ -1195,6 +1334,11 @@ impl ClipboardRepository for SqliteClipboardRepository {
                     for entry in batch.iter() {
                         let matches = entry.content.to_lowercase().contains(&term)
                             || entry.source_app.to_lowercase().contains(&term)
+                            || entry
+                                .ocr_text
+                                .as_deref()
+                                .map(|text| text.to_lowercase().contains(&term))
+                                .unwrap_or(false)
                             || entry.tags.iter().any(|t| t.to_lowercase().contains(&term));
 
                         if matches && seen.insert(entry.id) {
@@ -1343,5 +1487,318 @@ impl ClipboardRepository for SqliteClipboardRepository {
     ) -> Result<Option<(String, String, Option<String>)>, String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         self.get_entry_content_with_html_with_conn(&conn, id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::infrastructure::repository::migrations::run_migrations;
+
+    fn setup_fts_db() -> Arc<Mutex<Connection>> {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_migrations(&mut conn).expect("migrations failed");
+        Arc::new(Mutex::new(conn))
+    }
+
+    fn insert_entry(conn: &Connection, content: &str, app: &str, ts: i64) {
+        let preview: String = content.chars().take(50).collect();
+        conn.execute(
+            "INSERT INTO clipboard_history
+             (content_type, content, html_content, source_app, timestamp, preview,
+              is_pinned, content_hash, tags, is_external, pinned_order, source_app_path,
+              ocr_text, ocr_status)
+             VALUES ('text', ?1, NULL, ?2, ?3, ?4, 0, 0, '[]', 0, 0, NULL, NULL, 'pending')",
+            params![content, app, ts, preview],
+        )
+        .expect("insert failed");
+    }
+
+    #[test]
+    fn test_fts5_creation() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_migrations(&mut conn).expect("migrations failed");
+
+        let row: String = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='clipboard_fts'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("clipboard_fts VIRTUAL TABLE must exist after run_migrations");
+        assert_eq!(row, "clipboard_fts");
+
+        let trigger_count: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='trigger' AND name LIKE 'clipboard_history_a%'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("trigger count query failed");
+        assert_eq!(
+            trigger_count, 3,
+            "expected INSERT/UPDATE/DELETE triggers on clipboard_history"
+        );
+    }
+
+    #[test]
+    fn test_fts5_insert_trigger() {
+        let arc = setup_fts_db();
+        let conn = arc.lock().expect("lock");
+
+        insert_entry(
+            &conn,
+            "the quick brown fox jumps over the lazy dog",
+            "Browser",
+            1_700_000_000,
+        );
+
+        let fts_count: i32 = conn
+            .query_row("SELECT COUNT(*) FROM clipboard_fts", [], |r| r.get(0))
+            .expect("clipboard_fts count failed");
+        assert_eq!(fts_count, 1, "INSERT trigger must mirror to clipboard_fts");
+
+        let mirrored_content: String = conn
+            .query_row("SELECT content FROM clipboard_fts LIMIT 1", [], |r| {
+                r.get(0)
+            })
+            .expect("mirror query failed");
+        assert_eq!(
+            mirrored_content,
+            "the quick brown fox jumps over the lazy dog"
+        );
+    }
+
+    #[test]
+    fn test_fts5_search() {
+        let arc = setup_fts_db();
+        {
+            let conn = arc.lock().expect("lock");
+            insert_entry(
+                &conn,
+                "alpha apple banana foo cherry",
+                "App1",
+                1_700_000_000,
+            );
+            insert_entry(&conn, "delta elephant falcon grape", "App2", 1_700_000_001);
+            insert_entry(&conn, "hello foo world baz qux", "App3", 1_700_000_002);
+        }
+
+        let repo = SqliteClipboardRepository::new(arc);
+        let results = repo.search_fts("foo", 10).expect("search_fts failed");
+
+        assert_eq!(
+            results.len(),
+            2,
+            "expected exactly 2 entries containing 'foo'"
+        );
+        let contents: Vec<&str> = results.iter().map(|e| e.content.as_str()).collect();
+        assert!(contents.iter().any(|c| c.contains("apple banana foo")));
+        assert!(contents.iter().any(|c| c.contains("hello foo world")));
+    }
+
+    #[test]
+    fn test_fts5_search_returns_image_by_ocr_text() {
+        let arc = setup_fts_db();
+        {
+            let conn = arc.lock().expect("lock");
+            conn.execute(
+                "INSERT INTO clipboard_history
+                 (content_type, content, html_content, source_app, timestamp, preview,
+                  is_pinned, content_hash, tags, is_external, pinned_order, source_app_path,
+                  content_kinds, ocr_text, ocr_status)
+                 VALUES ('image', 'data:image/png;base64,AAAA', NULL, 'Screenshot', 1700000003,
+                         'screenshot image', 0, 0, '[]', 0, 0, NULL, '[]',
+                         'Bryobacterales bacterium annotation panel', 'done')",
+                [],
+            )
+            .expect("insert image row");
+        }
+
+        let repo = SqliteClipboardRepository::new(arc);
+        let results = repo
+            .search_fts("Bryobacterales", 10)
+            .expect("search_fts failed");
+
+        assert_eq!(results.len(), 1, "OCR text must make image searchable");
+        assert_eq!(results[0].content_type, "image");
+        assert_eq!(
+            results[0].ocr_text.as_deref(),
+            Some("Bryobacterales bacterium annotation panel")
+        );
+    }
+
+    #[test]
+    fn test_fts5_unicode() {
+        let arc = setup_fts_db();
+        {
+            let conn = arc.lock().expect("lock");
+            insert_entry(&conn, "Rust 是一门系统编程语言", "AppRust", 1_700_000_000);
+            insert_entry(&conn, "你好世界 欢迎使用 TieZ", "AppCJK", 1_700_000_001);
+            insert_entry(
+                &conn,
+                "Memory safety 🎉 zero-cost abstractions",
+                "AppEmoji",
+                1_700_000_002,
+            );
+            insert_entry(
+                &conn,
+                "plain ascii clipboard entry",
+                "AppAscii",
+                1_700_000_003,
+            );
+        }
+
+        let repo = SqliteClipboardRepository::new(arc);
+
+        let cjk_results = repo
+            .search_fts("你好世", 10)
+            .expect("CJK search_fts failed");
+        assert_eq!(
+            cjk_results.len(),
+            1,
+            "CJK 3-char query '你好世' (trigram minimum) must match exactly 1 row"
+        );
+        assert!(cjk_results[0].content.contains("你好世界"));
+
+        let ascii_results = repo
+            .search_fts("Rust", 10)
+            .expect("ASCII search_fts failed");
+        assert!(
+            ascii_results
+                .iter()
+                .any(|e| e.content.contains("Rust 是一门")),
+            "ASCII 'Rust' should match the CJK+ASCII row"
+        );
+
+        let emoji_results = repo
+            .search_fts("safety", 10)
+            .expect("emoji-row search_fts failed");
+        assert_eq!(emoji_results.len(), 1);
+        assert!(emoji_results[0].content.contains("🎉"));
+    }
+
+    fn has_column(conn: &Connection, table: &str, column: &str) -> bool {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({})", table))
+            .expect("table_info prepare");
+        let mut rows = stmt.query([]).expect("table_info query");
+        while let Some(row) = rows.next().expect("row iter") {
+            let name: String = row.get(1).expect("name col");
+            if name == column {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn has_index(conn: &Connection, index_name: &str) -> bool {
+        conn.query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?",
+            [index_name],
+            |_| Ok(()),
+        )
+        .is_ok()
+    }
+
+    #[test]
+    fn test_v13_adds_content_kinds_column() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_migrations(&mut conn).expect("initial migrations failed");
+
+        conn.execute(
+            "DROP INDEX IF EXISTS idx_clipboard_history_content_kinds",
+            [],
+        )
+        .expect("drop index");
+        conn.execute("DROP TRIGGER IF EXISTS clipboard_history_ai", [])
+            .expect("drop ai trigger");
+        conn.execute("DROP TRIGGER IF EXISTS clipboard_history_ad", [])
+            .expect("drop ad trigger");
+        conn.execute("DROP TRIGGER IF EXISTS clipboard_history_au", [])
+            .expect("drop au trigger");
+        conn.execute("DROP TABLE IF EXISTS clipboard_fts", [])
+            .expect("drop fts table");
+        conn.execute(
+            "DELETE FROM schema_migrations WHERE version IN (13, 14, 15)",
+            [],
+        )
+        .expect("version reset failed");
+        conn.execute(
+            "ALTER TABLE clipboard_history DROP COLUMN content_kinds",
+            [],
+        )
+        .expect("DROP COLUMN requires SQLite >= 3.35; rusqlite 0.31 bundled satisfies this");
+
+        assert!(
+            !has_column(&conn, "clipboard_history", "content_kinds"),
+            "pre-v13 state: content_kinds column must be missing"
+        );
+
+        run_migrations(&mut conn).expect("re-applied migrations failed");
+
+        assert!(
+            has_column(&conn, "clipboard_history", "content_kinds"),
+            "post-v13 state: content_kinds column must exist after migration"
+        );
+
+        let dflt_value: String = conn
+            .query_row(
+                "SELECT dflt_value FROM pragma_table_info('clipboard_history') WHERE name='content_kinds'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("column metadata query");
+        assert_eq!(
+            dflt_value, "'[]'",
+            "content_kinds default must be the JSON array literal '[]'"
+        );
+    }
+
+    #[test]
+    fn test_v13_indexes_exist() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_migrations(&mut conn).expect("migrations failed");
+
+        assert!(
+            has_index(&conn, "idx_clipboard_history_content_kinds"),
+            "idx_clipboard_history_content_kinds must exist after v13"
+        );
+    }
+
+    #[test]
+    fn test_v13_fts5_rebuild() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_migrations(&mut conn).expect("migrations failed");
+
+        assert!(
+            has_column(&conn, "clipboard_fts", "content_kinds"),
+            "v13 FTS5 schema must include content_kinds column"
+        );
+
+        let arc = Arc::new(Mutex::new(conn));
+        {
+            let conn = arc.lock().expect("lock");
+            insert_entry(
+                &conn,
+                "alpha apple banana foo cherry",
+                "App1",
+                1_700_000_000,
+            );
+            insert_entry(&conn, "delta elephant falcon grape", "App2", 1_700_000_001);
+            insert_entry(&conn, "hello foo world baz qux", "App3", 1_700_000_002);
+        }
+
+        let repo = SqliteClipboardRepository::new(arc);
+        let results = repo.search_fts("foo", 10).expect("search_fts failed");
+        assert_eq!(
+            results.len(),
+            2,
+            "v13 FTS5 must still match both 'foo'-bearing entries after rebuild"
+        );
+        let contents: Vec<&str> = results.iter().map(|e| e.content.as_str()).collect();
+        assert!(contents.iter().any(|c| c.contains("apple banana foo")));
+        assert!(contents.iter().any(|c| c.contains("hello foo world")));
     }
 }

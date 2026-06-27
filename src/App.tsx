@@ -3,6 +3,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import ToastContainer from "./shared/components/ToastContainer";
 import ConfirmDialog from "./shared/components/ConfirmDialog";
+import ProgressToast from "./features/shared/components/ProgressToast";
+import { useProgress } from "./features/shared/hooks/useProgress";
 
 import { translations } from "./locales";
 import AppHeader from "./features/app/components/AppHeader";
@@ -41,6 +43,7 @@ import { useSearchFetchTrigger } from "./shared/hooks/useSearchFetchTrigger";
 import { useScrollToSelection } from "./shared/hooks/useScrollToSelection";
 import { useClipboardItemRenderer } from "./shared/hooks/useClipboardItemRenderer";
 import { useOverlays } from "./shared/hooks/useOverlays";
+import QrCodeDialog from "./features/clipboard/components/QrCodeDialog";
 import type { ClipboardEntry } from "./shared/types";
 import type { VirtualClipboardListHandle } from "./features/clipboard/types";
 
@@ -220,8 +223,10 @@ const App = () => {
   const debouncedSearch = useDebounce(search, 400);
   const searchInputRef = useInputFocus<HTMLInputElement>();
   const tagColors = useTagColors();
+  const { toasts: progressToasts, dismiss: dismissProgress } = useProgress();
   const virtualListRef = useRef<VirtualClipboardListHandle | null>(null);
   const [showScrollTop, setShowScrollTop] = useState(false);
+  const [qrEntry, setQrEntry] = useState<ClipboardEntry | null>(null);
   const PAGE_SIZE = HISTORY_PAGE_SIZE;
   const { fetchHistory, loadMoreHistory } = useHistoryFetch({
     debouncedSearch,
@@ -654,7 +659,15 @@ const App = () => {
     deleteEntry,
     setEditingTagsId,
     setTagInput,
-    handleUpdateTags
+    handleUpdateTags,
+    onQRCode: (item) => setQrEntry(item),
+    onTransformError: (_item, _kind, message) => {
+      const msg = message || "unknown error";
+      pushToast(t("transform_failed").replace("{message}", msg));
+    },
+    onTransformSuccess: (_item, _kind) => {
+      pushToast(t("transform_applied"));
+    }
   });
 
   const settingsPanelProps = useSettingsPanelProps({
@@ -754,6 +767,8 @@ const App = () => {
 
       <ToastContainer toasts={toasts} />
 
+      <ProgressToast toasts={progressToasts} onDismiss={dismissProgress} />
+
       <ConfirmDialog
         open={confirmDialog.show}
         title={confirmDialog.title}
@@ -764,6 +779,13 @@ const App = () => {
         onClose={closeConfirm}
         onConfirm={confirmDialog.onConfirm}
       />
+
+      {qrEntry && (
+        <QrCodeDialog
+          entry={qrEntry}
+          onClose={() => setQrEntry(null)}
+        />
+      )}
 
     </div >
   );

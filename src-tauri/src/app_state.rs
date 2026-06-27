@@ -1,8 +1,8 @@
+use crate::domain::models::ClipboardEntry;
+use crate::services::encryption_queue::EncryptionQueue;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Mutex;
-use crate::domain::models::ClipboardEntry;
-use crate::services::encryption_queue::EncryptionQueue;
 
 pub struct SettingsState {
     pub deduplicate: AtomicBool,
@@ -19,6 +19,11 @@ pub struct SettingsState {
     pub sequential_paste_hotkey: Mutex<String>,
     pub rich_paste_hotkey: Mutex<String>,
     pub search_hotkey: Mutex<String>,
+    pub screenshot_enabled: AtomicBool,
+    pub screenshot_hotkey: Mutex<String>,
+    pub quick_paste_enabled: AtomicBool,
+    pub quick_paste_hotkey: Mutex<String>,
+    pub ocr_enabled: AtomicBool,
     pub sound_enabled: AtomicBool,
     pub hide_tray_icon: AtomicBool,
     pub edge_docking: AtomicBool,
@@ -45,3 +50,31 @@ pub struct SessionHistory(pub Mutex<VecDeque<ClipboardEntry>>);
 pub struct AppDataDir(pub Mutex<std::path::PathBuf>);
 
 pub struct EncryptionQueueState(pub EncryptionQueue);
+
+const SEARCH_HISTORY_MAX: usize = 20;
+
+#[derive(Default)]
+pub struct SearchHistory(pub Mutex<VecDeque<String>>);
+
+impl SearchHistory {
+    pub fn push(&self, query: String) {
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if let Ok(mut guard) = self.0.lock() {
+            guard.retain(|existing| existing != trimmed);
+            guard.push_front(trimmed.to_string());
+            while guard.len() > SEARCH_HISTORY_MAX {
+                guard.pop_back();
+            }
+        }
+    }
+
+    pub fn snapshot(&self) -> Vec<String> {
+        self.0
+            .lock()
+            .map(|guard| guard.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+}

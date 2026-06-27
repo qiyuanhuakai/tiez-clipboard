@@ -1,4 +1,4 @@
-import { useRef, useEffect, useState, useMemo, memo } from "react";
+import { useRef, useEffect, useState, useMemo, useCallback, memo } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import type { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { currentMonitor, getCurrentWindow, PhysicalPosition, PhysicalSize } from "@tauri-apps/api/window";
@@ -33,8 +33,11 @@ import { extractRichImageFallback, resolveRichImageSrc } from "../../../shared/l
 import { getSourceAppIcon, peekSourceAppIcon } from "../../../shared/lib/sourceAppIcon";
 import { seekVideoPreviewFrame } from "../../../shared/lib/videoPreview";
 import { getContentTypeIcon } from "../../../shared/lib/contentTypeIcon";
+import { ItemContextMenu } from "./ItemContextMenu";
+import type { TransformKindDto } from "./ItemContextMenu";
 
 const COMPACT_PREVIEW_LABEL = "compact-preview";
+const CONTEXT_MENU_OPEN_EVENT = "tiez:context-menu-open";
 
 let linuxChecked = false;
 let isLinuxPlatform = false;
@@ -577,14 +580,30 @@ const ClipboardItem = ({
     id,
     compactMode,
     className,
-    disableLayout
-}: ClipboardItemProps & { compactMode?: boolean, className?: string }) => {
+    disableLayout,
+    onQRCode,
+    onTransformItem,
+    onTransformItemError,
+    onTransformItemSuccess,
+}: ClipboardItemProps & {
+    compactMode?: boolean;
+    className?: string;
+    onQRCode?: () => void;
+    onTransformItem?: (kind: string) => void;
+    onTransformItemError?: (kind: string, message: string) => void;
+    onTransformItemSuccess?: (kind: string) => void;
+}) => {
     const tagInputRef = useRef<HTMLInputElement>(null);
     const [localTagInput, setLocalTagInput] = useState(tagInput);
     const [snapshotFailed, setSnapshotFailed] = useState(false);
     const [richImageFallbackFailed, setRichImageFallbackFailed] = useState(false);
     const [richTextSnapshotSrc, setRichTextSnapshotSrc] = useState<string | null>(null);
     const [sourceAppIcon, setSourceAppIcon] = useState<string | null>(() => peekSourceAppIcon(item.source_app_path) ?? null);
+    const [contextMenuState, setContextMenuState] = useState<{ x: number; y: number } | null>(null);
+    const [transformKinds, setTransformKinds] = useState<TransformKindDto[]>([]);
+    const [ocrText, setOcrText] = useState<string | null>(item.ocr_text ?? null);
+    const [ocrStatus, setOcrStatus] = useState<string | null>(item.ocr_status ?? null);
+    const [ocrTextExpanded, setOcrTextExpanded] = useState(false);
     const isComposing = useRef(false);
     const richSnapshotImgRef = useRef<HTMLImageElement | null>(null);
     const richSnapshotFallbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -863,6 +882,172 @@ const ClipboardItem = ({
         };
     }, []);
 
+    useEffect(() => {
+        invoke<TransformKindDto[]>("list_transform_kinds")
+            .then((kinds) => {
+                if (kinds && Array.isArray(kinds)) {
+                    setTransformKinds(kinds);
+                }
+            })
+            .catch(() => {});
+    }, []);
+
+    useEffect(() => {
+        const unlisten = listen<{ item_id: number; text: string; status: string }>(
+            "ocr:complete",
+            (event) => {
+                if (event.payload.item_id === item.id) {
+                    setOcrStatus(event.payload.status);
+                    setOcrText(event.payload.text || null);
+                }
+            }
+        );
+        return () => {
+            unlisten.then((fn) => fn());
+        };
+    }, [item.id]);
+
+    useEffect(() => {
+        setOcrText(item.ocr_text ?? null);
+        setOcrStatus(item.ocr_status ?? null);
+        setOcrTextExpanded(false);
+    }, [item.id, item.ocr_text, item.ocr_status]);
+
+    const [ocrRunning, setOcrRunning] = useState(false);
+
+    const handleOcr = useCallback(() => {
+        if (ocrRunning || item.content_type !== "image") return;
+        setOcrRunning(true);
+        setOcrStatus("processing");
+        invoke("recognize_clipboard_image", { itemId: item.id })
+            .then((result: unknown) => {
+                const res = result as { text: string; status: string };
+                setOcrText(res.text || null);
+                setOcrStatus(res.status);
+            })
+            .catch((err) => {
+                const msg = err instanceof Error ? err.message : String(err);
+                setOcrStatus("failed");
+                setContextMenuState(null);
+                console.error("OCR failed:", msg);
+            })
+            .finally(() => setOcrRunning(false));
+    }, [item.id, item.content_type, ocrRunning]);
+
+    const handleTransform = useCallback((kind: string) => {
+        const proceed = (text: string) => {
+            invoke("copy_to_clipboard", {
+                content: text,
+                contentType: "text",
+                paste: false,
+                id: 0,
+                deleteAfterUse: false,
+                pasteWithFormat: false,
+                moveToTop: false,
+                pasteImageAsBase64: false
+            })
+                .then(() => onTransformItemSuccess?.(kind))
+                .catch((err) => {
+                    const msg = err instanceof Error ? err.message : String(err);
+                    onTransformItemError?.(kind, msg);
+                });
+        };
+        onTransformItem?.(kind);
+        invoke<string>("transform_text", { text: item.content, kind })
+            .then((result) => {
+                if (result) {
+                    proceed(result);
+                } else {
+                    onTransformItemError?.(kind, "transform returned empty result");
+                }
+            })
+            .catch((err) => {
+                const msg = err instanceof Error ? err.message : String(err);
+                onTransformItemError?.(kind, msg);
+            });
+    }, [item.content, onTransformItem, onTransformItemError, onTransformItemSuccess]);
+
+    const handleImageBase64Copy = useCallback(async () => {
+        if (item.content_type !== "image") return;
+        try {
+            await invoke("copy_to_clipboard", {
+                content: item.content,
+                contentType: "image",
+                paste: false,
+                id: item.id,
+                deleteAfterUse: false,
+                pasteWithFormat: false,
+                moveToTop: false,
+                pasteImageAsBase64: true
+            });
+            onTransformItemSuccess?.("image_base64");
+        } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            onTransformItemError?.("image_base64", msg);
+        }
+    }, [item.content, item.content_type, item.id, onTransformItemError, onTransformItemSuccess]);
+
+    const handleShare = useCallback(async () => {
+        try {
+            if (navigator.share) {
+                await navigator.share({ text: item.content });
+                return;
+            }
+            await navigator.clipboard.writeText(item.content);
+        } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            onTransformItemError?.("share", msg);
+        }
+    }, [item.content, onTransformItemError]);
+
+    const handleContextMenuAction = useCallback((action: string) => {
+        switch (action) {
+            case "copy":
+                onCopy(false, false);
+                break;
+            case "editTags":
+                onToggleTagEditor(new MouseEvent("contextmenu") as never);
+                break;
+            case "qrCode":
+                onQRCode?.();
+                break;
+            case "delete":
+                onDelete(new MouseEvent("contextmenu") as never);
+                break;
+            case "pin":
+                onTogglePin(new MouseEvent("contextmenu") as never);
+                break;
+            case "share":
+                void handleShare();
+                break;
+            case "imageBase64":
+                void handleImageBase64Copy();
+                break;
+        }
+    }, [onCopy, onToggleTagEditor, onQRCode, onDelete, onTogglePin, handleShare, handleImageBase64Copy]);
+
+    useEffect(() => {
+        if (!contextMenuState) return;
+        setIgnoreBlurSafe(true);
+        const handleClick = () => setContextMenuState(null);
+        document.addEventListener("click", handleClick);
+        return () => {
+            document.removeEventListener("click", handleClick);
+            setIgnoreBlurSafe(false);
+        };
+    }, [contextMenuState]);
+
+    useEffect(() => {
+        const handleOtherMenuOpen = (e: Event) => {
+            const customEvent = e as CustomEvent<{ id: string }>;
+            if (customEvent.detail?.id !== String(item.id) && contextMenuState) {
+                setContextMenuState(null);
+            }
+        };
+        window.addEventListener(CONTEXT_MENU_OPEN_EVENT, handleOtherMenuOpen);
+        return () => window.removeEventListener(CONTEXT_MENU_OPEN_EVENT, handleOtherMenuOpen);
+    }, [contextMenuState, item.id]);
+
     const renderFilePreview = () => {
         if (item.file_preview_exists === false) {
             return (
@@ -949,18 +1134,19 @@ const ClipboardItem = ({
                 if (target.closest('button') || target.closest('input') || target.closest('textarea')) {
                     return;
                 }
+                if (hoverTimerRef.current) {
+                    clearTimeout(hoverTimerRef.current);
+                    hoverTimerRef.current = null;
+                }
                 void hideCompactPreviewGlobal();
                 e.preventDefault();
-                // Prevent link navigation on right-click too
-                if (target.closest('a')) {
-                    e.stopPropagation();
-                }
-                const pasteImageAsBase64 = item.content_type === "image";
-                onCopy(!pasteImageAsBase64, pasteImageAsBase64);
-                onSelect();
+                e.stopPropagation();
+                window.dispatchEvent(new CustomEvent(CONTEXT_MENU_OPEN_EVENT, { detail: { id: item.id } }));
+                setContextMenuState({ x: e.clientX, y: e.clientY });
             }}
             onMouseEnter={(e) => {
                 if (!compactMode) return;
+                if (contextMenuState) return;
                 compactPreviewLog("mouseenter schedule preview", { itemId: item.id });
                 hoverAnchorRef.current = {
                     clientX: e.clientX,
@@ -984,6 +1170,7 @@ const ClipboardItem = ({
             }}
             onMouseMove={(e) => {
                 if (!compactMode) return;
+                if (contextMenuState) return;
                 hoverAnchorRef.current = {
                     clientX: e.clientX,
                     clientY: e.clientY,
@@ -1060,6 +1247,34 @@ const ClipboardItem = ({
                         </button>
                     </div>
                     <div className="app-info" style={{ opacity: 0.6, fontSize: '10px', display: 'flex', gap: '6px', alignItems: 'center' }}>
+                        {ocrStatus && ocrStatus !== "pending" && (
+                            <span
+                                data-testid="ocr-badge"
+                                className="ocr-badge"
+                                style={{
+                                    fontSize: '9px',
+                                    padding: '1px 4px',
+                                    borderRadius: '3px',
+                                    background: ocrStatus === "done"
+                                        ? 'var(--accent-color, #4a9eff)'
+                                        : ocrStatus === "processing"
+                                            ? 'var(--text-secondary, #888)'
+                                            : ocrStatus === "failed"
+                                                ? 'var(--error-color, #e74c3c)'
+                                                : 'var(--text-tertiary, #666)',
+                                    color: '#fff',
+                                    whiteSpace: 'nowrap',
+                                }}
+                            >
+                                {ocrStatus === "processing"
+                                    ? t('ocr_processing')
+                                    : ocrStatus === "done"
+                                        ? t('ocr_done_label')
+                                        : ocrStatus === "failed"
+                                            ? t('ocr_failed_label')
+                                            : t('ocr_unsupported_label')}
+                            </span>
+                        )}
                         <span>{getConciseTime(item.timestamp, language)}</span>
                     </div>
                 </div>
@@ -1209,6 +1424,63 @@ const ClipboardItem = ({
                 )}
             </div>
 
+            {ocrStatus === "done" && ocrText && (
+                <div
+                    data-testid="ocr-section"
+                    className="ocr-text-section"
+                    style={{
+                        marginTop: '4px',
+                        borderTop: '1px solid var(--border-color, rgba(128,128,128,0.2))',
+                        paddingTop: '4px',
+                    }}
+                >
+                    <button
+                        data-testid="ocr-toggle"
+                        className="btn-icon"
+                        onClick={(e) => {
+                            e.stopPropagation();
+                            setOcrTextExpanded((prev) => !prev);
+                        }}
+                        title={t('ocr_toggle_label')}
+                        style={{
+                            fontSize: '9px',
+                            padding: '1px 4px',
+                            background: 'none',
+                            border: 'none',
+                            color: 'var(--text-secondary, #888)',
+                            cursor: 'pointer',
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '4px',
+                        }}
+                    >
+                        {ocrTextExpanded ? '▼' : '▶'} {t('ocr_done_label')}
+                    </button>
+                    {ocrTextExpanded && (
+                        <div
+                            data-testid="ocr-text"
+                            className="ocr-text-content"
+                            style={{
+                                fontSize: '11px',
+                                color: 'var(--text-secondary, #888)',
+                                fontFamily: 'var(--font-mono, monospace)',
+                                lineHeight: '1.4',
+                                maxHeight: '80px',
+                                overflow: 'auto',
+                                whiteSpace: 'pre-wrap',
+                                wordBreak: 'break-all',
+                                padding: '2px 4px',
+                                marginTop: '2px',
+                                borderRadius: '3px',
+                                background: 'var(--bg-tertiary, rgba(128,128,128,0.05))',
+                            }}
+                        >
+                            {ocrText}
+                        </div>
+                    )}
+                </div>
+            )}
+
             {(item.tags?.length > 0 || isEditingTags) && (
                 <div
                     className="item-tags-container"
@@ -1307,6 +1579,27 @@ const ClipboardItem = ({
                     )}
                 </div>
             )}
+            {contextMenuState && (
+                <ItemContextMenu
+                    x={contextMenuState.x}
+                    y={contextMenuState.y}
+                    entry={item}
+                    onSelect={handleContextMenuAction}
+                    onClose={() => setContextMenuState(null)}
+                    onCopy={() => handleContextMenuAction("copy")}
+                    onEditTags={() => handleContextMenuAction("editTags")}
+                    onQRCode={() => handleContextMenuAction("qrCode")}
+                    onDelete={() => handleContextMenuAction("delete")}
+                    onPin={() => handleContextMenuAction("pin")}
+                    onShare={() => handleContextMenuAction("share")}
+                    onImageBase64={() => handleContextMenuAction("imageBase64")}
+                    onTransform={handleTransform}
+                    onOcr={handleOcr}
+                    transformKinds={transformKinds}
+                    language={language === "zh" ? "zh" : language === "en" ? "en" : "zh"}
+                    ocrRunning={ocrRunning}
+                />
+            )}
         </motion.div>
     );
 };
@@ -1325,6 +1618,8 @@ export default memo(ClipboardItem, (prevProps, nextProps) => {
         prevProps.item.is_external === nextProps.item.is_external &&
         prevProps.item.file_preview_exists === nextProps.item.file_preview_exists &&
         prevProps.item.tags === nextProps.item.tags &&
+        prevProps.item.ocr_text === nextProps.item.ocr_text &&
+        prevProps.item.ocr_status === nextProps.item.ocr_status &&
         prevProps.isRevealed === nextProps.isRevealed &&
         prevProps.isEditingTags === nextProps.isEditingTags &&
         prevProps.richTextSnapshotPreview === nextProps.richTextSnapshotPreview &&

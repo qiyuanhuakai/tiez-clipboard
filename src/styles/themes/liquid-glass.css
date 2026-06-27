@@ -680,6 +680,21 @@ body.theme-liquid-glass:not(.hide-app-border) {
   transition: border-color 0.18s ease, box-shadow 0.18s ease, background-color 0.18s ease !important;
 }
 
+.theme-liquid-glass .tiez-select__input-container,
+.theme-liquid-glass .tiez-select__input {
+  color: var(--select-single-value-color) !important;
+  font-weight: 500 !important;
+}
+
+.theme-liquid-glass .tiez-select__input {
+  caret-color: var(--accent-color) !important;
+}
+
+.theme-liquid-glass .tiez-select__placeholder {
+  color: var(--select-placeholder-color) !important;
+  font-weight: 500 !important;
+}
+
 .theme-liquid-glass .tiez-select__control--is-focused {
   box-shadow: var(--select-control-focus-shadow) !important;
   border-color: var(--select-control-focus-border) !important;
@@ -1971,4 +1986,27 @@ body.dark-mode .themed-tag-manager.theme-liquid-glass .confirm-dialog-button.pri
 
 .theme-liquid-glass ::-webkit-scrollbar-corner {
   background: transparent !important;
+}
+
+/* ============================================================
+   21. Context menu — opaque glass to avoid transparency bleed
+   ============================================================ */
+.theme-liquid-glass .item-context-menu,
+.theme-liquid-glass .item-context-menu__submenu {
+  background: rgba(245, 245, 250, 0.95) !important;
+  backdrop-filter: blur(20px) saturate(130%) !important;
+  -webkit-backdrop-filter: blur(20px) saturate(130%) !important;
+  border: 1px solid rgba(60, 60, 67, 0.12) !important;
+  box-shadow:
+    0 8px 32px rgba(20, 30, 60, 0.18),
+    inset 0 1px 0 rgba(255, 255, 255, 0.50) !important;
+}
+
+body.dark-mode.theme-liquid-glass .item-context-menu,
+body.dark-mode.theme-liquid-glass .item-context-menu__submenu {
+  background: rgba(20, 20, 30, 0.95) !important;
+  border: 1px solid rgba(255, 255, 255, 0.08) !important;
+  box-shadow:
+    0 8px 32px rgba(0, 0, 0, 0.40),
+    inset 0 1px 0 rgba(255, 255, 255, 0.06) !important;
 }

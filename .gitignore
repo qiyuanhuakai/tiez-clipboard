@@ -26,3 +26,6 @@ Thumbs.db
 .omo/
 CLAUDE.md
 AGENTS.md
+tiez-c-standalone/target/
+backup-e2e/
+src-tauri/binaries/

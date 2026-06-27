@@ -6,6 +6,7 @@ use crate::app_state::SettingsState;
 use crate::global_state::{
     IS_DESTROYED, LAST_HIDDEN_TIMESTAMP, RECREATE_PENDING, WINDOW_LIFECYCLE,
 };
+use crate::infrastructure::webview_environment;
 
 pub const LIFECYCLE_OPEN: u8 = 0;
 pub const LIFECYCLE_CLOSING: u8 = 1;
@@ -15,6 +16,8 @@ pub const LIFECYCLE_OPENING: u8 = 3;
 pub const DEFAULT_IDLE_DESTROY_SECONDS: u64 = 60;
 pub const MIN_IDLE_DESTROY_SECONDS: u64 = 5;
 pub const MAX_IDLE_DESTROY_SECONDS: u64 = 3600;
+const LABEL_RELEASE_TIMEOUT: Duration = Duration::from_millis(200);
+const BROWSER_PROCESS_EXIT_TIMEOUT: Duration = Duration::from_millis(3000);
 
 /// Pure decision: should the idle destroyer tear down the webview right now?
 ///
@@ -55,6 +58,14 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+fn should_recreate_main_window(window_exists: bool, is_destroyed: bool, lifecycle: u8) -> bool {
+    !window_exists || is_destroyed || lifecycle != LIFECYCLE_OPEN
+}
+
+fn main_window_ready(window_exists: bool, is_destroyed: bool, lifecycle: u8) -> bool {
+    window_exists && !is_destroyed && lifecycle == LIFECYCLE_OPEN
+}
+
 /// Record that the main window is currently hidden.
 /// Safe to call multiple times; latest timestamp wins.
 pub fn mark_hidden() {
@@ -80,6 +91,11 @@ pub fn on_visibility_changed(visible: bool) {
 /// Tear down the main webview if preconditions hold. No-op when already destroyed
 /// or when state transitions are unsafe. Safe to call from any thread.
 pub fn try_destroy_idle(app: &AppHandle) -> bool {
+    if WINDOW_LIFECYCLE.load(Ordering::SeqCst) == LIFECYCLE_CLOSING {
+        complete_pending_destroy(app);
+        return false;
+    }
+
     let settings = match app.try_state::<SettingsState>() {
         Some(s) => s,
         None => return false,
@@ -96,7 +112,12 @@ pub fn try_destroy_idle(app: &AppHandle) -> bool {
 
     // Transition Open → Closing atomically; bail if someone else is mid-transition.
     if WINDOW_LIFECYCLE
-        .compare_exchange(LIFECYCLE_OPEN, LIFECYCLE_CLOSING, Ordering::SeqCst, Ordering::Relaxed)
+        .compare_exchange(
+            LIFECYCLE_OPEN,
+            LIFECYCLE_CLOSING,
+            Ordering::SeqCst,
+            Ordering::Relaxed,
+        )
         .is_err()
     {
         return false;
@@ -107,18 +128,97 @@ pub fn try_destroy_idle(app: &AppHandle) -> bool {
         now_ms().saturating_sub(hidden_since) / 1000
     );
 
-    if let Some(win) = app.get_webview_window("main") {
-        let _ = win.destroy();
+    if !destroy_main_window(app, false) {
+        WINDOW_LIFECYCLE.store(LIFECYCLE_OPEN, Ordering::SeqCst);
+        return false;
     }
 
-    // We can't guarantee the runtime has freed the label yet, but we mark intent
-    // so the recreate path polls correctly.
+    finish_main_destroy(app, false);
+
+    if WINDOW_LIFECYCLE.load(Ordering::SeqCst) == LIFECYCLE_CLOSED
+        && RECREATE_PENDING.swap(false, Ordering::SeqCst)
+    {
+        let _ = recreate_main_window(app);
+    }
+    true
+}
+
+fn destroy_main_window(app: &AppHandle, wait_for_browser_exit: bool) -> bool {
+    if let Some(win) = app.get_webview_window("main") {
+        if wait_for_browser_exit {
+            webview_environment::reset_main_browser_process_exit();
+            if !webview_environment::watch_main_browser_process_exit(&win) {
+                webview_environment::mark_main_browser_process_exited();
+                return false;
+            }
+        } else {
+            webview_environment::mark_main_browser_process_exited();
+        }
+        let _ = win.destroy();
+        true
+    } else {
+        webview_environment::mark_main_browser_process_exited();
+        true
+    }
+}
+
+fn wait_for_label_release(app: &AppHandle, timeout: Duration) -> bool {
+    let mut waited = Duration::from_millis(0);
+    while app.get_webview_window("main").is_some() {
+        if waited >= timeout {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+        waited += Duration::from_millis(5);
+    }
+    true
+}
+
+fn finish_main_destroy(app: &AppHandle, wait_for_browser_exit: bool) -> bool {
+    let label_released = wait_for_label_release(app, LABEL_RELEASE_TIMEOUT);
+    let browser_exited = if wait_for_browser_exit {
+        webview_environment::wait_for_main_browser_process_exit(BROWSER_PROCESS_EXIT_TIMEOUT)
+    } else {
+        true
+    };
+
+    if !label_released {
+        crate::warn!("[idle-destroyer] Timed out waiting for label to be freed after destroy.");
+    }
+    if wait_for_browser_exit && !browser_exited {
+        crate::warn!(
+            "[idle-destroyer] Timed out waiting for WebView2 browser process exit after destroy."
+        );
+    }
+
+    LAST_HIDDEN_TIMESTAMP.store(0, Ordering::SeqCst);
+    let (lifecycle, is_destroyed, completed) =
+        destroy_completion_state(label_released, browser_exited);
+    WINDOW_LIFECYCLE.store(lifecycle, Ordering::SeqCst);
+    IS_DESTROYED.store(is_destroyed, Ordering::SeqCst);
+    completed
+}
+
+fn destroy_completion_state(label_released: bool, browser_exited: bool) -> (u8, bool, bool) {
+    if label_released && browser_exited {
+        (LIFECYCLE_CLOSED, true, true)
+    } else {
+        (LIFECYCLE_CLOSING, label_released, false)
+    }
+}
+
+fn complete_pending_destroy(app: &AppHandle) -> bool {
+    if app.get_webview_window("main").is_some() {
+        return false;
+    }
+    if !webview_environment::main_browser_process_exited() {
+        return false;
+    }
     WINDOW_LIFECYCLE.store(LIFECYCLE_CLOSED, Ordering::SeqCst);
     IS_DESTROYED.store(true, Ordering::SeqCst);
-
-    // If a recreate was queued while we were transitioning, honor it now.
+    LAST_HIDDEN_TIMESTAMP.store(0, Ordering::SeqCst);
     if RECREATE_PENDING.swap(false, Ordering::SeqCst) {
-        let _ = recreate_main_window(app);
+        return recreate_main_window(app);
     }
     true
 }
@@ -145,18 +245,12 @@ pub fn recreate_main_window(app: &AppHandle) -> bool {
         return false;
     }
 
-    // Poll for the label to be freed. destroy() is a queued message; the
-    // Tauri HashMap releases the label only after the runtime processes the
-    // Destroyed event. In practice this is <10ms; cap at ~200ms to be safe.
-    let mut waited_ms: u64 = 0;
-    while app.get_webview_window("main").is_some() {
-        if waited_ms >= 200 {
-            crate::warn!("[idle-destroyer] Timed out waiting for label to be freed; aborting recreate.");
-            WINDOW_LIFECYCLE.store(LIFECYCLE_CLOSED, Ordering::SeqCst);
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(5));
-        waited_ms += 5;
+    if !wait_for_label_release(app, LABEL_RELEASE_TIMEOUT) {
+        crate::warn!(
+            "[idle-destroyer] Timed out waiting for label to be freed; aborting recreate."
+        );
+        WINDOW_LIFECYCLE.store(LIFECYCLE_CLOSED, Ordering::SeqCst);
+        return false;
     }
 
     let config = match app.config().app.windows.iter().find(|c| c.label == "main") {
@@ -168,9 +262,7 @@ pub fn recreate_main_window(app: &AppHandle) -> bool {
         }
     };
 
-    match WebviewWindowBuilder::from_config(app, config)
-        .and_then(|b| b.build())
-    {
+    match WebviewWindowBuilder::from_config(app, config).and_then(|b| b.build()) {
         Ok(_) => {
             WINDOW_LIFECYCLE.store(LIFECYCLE_OPEN, Ordering::SeqCst);
             IS_DESTROYED.store(false, Ordering::SeqCst);
@@ -191,11 +283,83 @@ pub fn recreate_main_window(app: &AppHandle) -> bool {
 
 /// Public entry for callers (hotkey handler, tray, frontend) that want to
 /// guarantee the main window exists before showing it. Idempotent.
-pub fn ensure_main_window(app: &AppHandle) {
-    if app.get_webview_window("main").is_some() {
-        return;
+pub fn ensure_main_window(app: &AppHandle) -> bool {
+    let window_exists = app.get_webview_window("main").is_some();
+    let is_destroyed = IS_DESTROYED.load(Ordering::SeqCst);
+    let lifecycle = WINDOW_LIFECYCLE.load(Ordering::SeqCst);
+
+    if lifecycle == LIFECYCLE_CLOSING {
+        if complete_pending_destroy(app) {
+            return main_window_ready(
+                app.get_webview_window("main").is_some(),
+                IS_DESTROYED.load(Ordering::SeqCst),
+                WINDOW_LIFECYCLE.load(Ordering::SeqCst),
+            );
+        }
+        request_recreate_after_destroy();
+        return false;
+    }
+
+    if !should_recreate_main_window(window_exists, is_destroyed, lifecycle) {
+        return true;
     }
     let _ = recreate_main_window(app);
+    main_window_ready(
+        app.get_webview_window("main").is_some(),
+        IS_DESTROYED.load(Ordering::SeqCst),
+        WINDOW_LIFECYCLE.load(Ordering::SeqCst),
+    )
+}
+
+pub fn restart_main_window_for_gpu_switch(app: &AppHandle, disabled: bool) -> bool {
+    crate::app::gpu_switcher::apply_gpu_disable_env(disabled);
+
+    if WINDOW_LIFECYCLE
+        .compare_exchange(
+            LIFECYCLE_OPEN,
+            LIFECYCLE_CLOSING,
+            Ordering::SeqCst,
+            Ordering::Relaxed,
+        )
+        .is_err()
+    {
+        request_recreate_after_destroy();
+        return false;
+    }
+
+    let was_visible = app
+        .get_webview_window("main")
+        .and_then(|window| window.is_visible().ok())
+        .unwrap_or(false);
+
+    if let Some(preview) = app.get_webview_window("compact-preview") {
+        let _ = preview.destroy();
+    }
+
+    if !destroy_main_window(app, true) {
+        WINDOW_LIFECYCLE.store(LIFECYCLE_OPEN, Ordering::SeqCst);
+        return false;
+    }
+    let teardown_completed = finish_main_destroy(app, true);
+    if !teardown_completed {
+        if was_visible {
+            request_recreate_after_destroy();
+        }
+        return false;
+    }
+
+    if !recreate_main_window(app) {
+        return false;
+    }
+
+    if was_visible {
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.show();
+            mark_shown();
+        }
+    }
+
+    true
 }
 
 /// Spawn the background ticker that calls `try_destroy_idle` once per second.
@@ -315,5 +479,37 @@ mod tests {
         // consistently if called with smaller values.
         assert!(should_destroy_now(1_000, 1_001, 0, true, false));
         assert!(!should_destroy_now(0, 0, 0, true, false));
+    }
+
+    #[test]
+    fn should_recreate_when_destroyed_state_keeps_stale_label() {
+        assert!(should_recreate_main_window(true, true, LIFECYCLE_CLOSED));
+    }
+
+    #[test]
+    fn main_window_not_ready_when_destroyed_state_keeps_stale_label() {
+        assert!(!main_window_ready(true, true, LIFECYCLE_CLOSED));
+    }
+
+    #[test]
+    fn should_not_recreate_when_open_state_has_window() {
+        assert!(!should_recreate_main_window(true, false, LIFECYCLE_OPEN));
+        assert!(main_window_ready(true, false, LIFECYCLE_OPEN));
+    }
+
+    #[test]
+    fn destroy_completion_waits_for_browser_process_exit() {
+        assert_eq!(
+            destroy_completion_state(true, false),
+            (LIFECYCLE_CLOSING, true, false)
+        );
+    }
+
+    #[test]
+    fn destroy_completion_closes_only_after_label_and_browser_exit() {
+        assert_eq!(
+            destroy_completion_state(true, true),
+            (LIFECYCLE_CLOSED, true, true)
+        );
     }
 }
